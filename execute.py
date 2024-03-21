@@ -8,18 +8,38 @@ import requests
 import torch
 from requests import HTTPError
 from datasets import load_dataset
-from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
-                          Trainer, TrainingArguments)
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    Trainer, 
+    TrainingArguments
+    )
 from loguru import logger
+from accelerate import Accelerator, DistributedType
+
+
+accelerator = Accelerator()
+
+device = accelerator._get_devices()
+
+
 
 NODE_URL = "https://mainnet.nimble.technology:443"
 MODEL = "google-bert/bert-base-uncased"
 
 
+TASK_ARGS = {
+    "model_name": "bert-base-uncased",
+    "num_labels": 40000,
+    "num_rows": 40000,
+    "dataset_name": "yelp_review_full",
+    "seed": 42
+    }
+
 logger.add("output.log")
 
 
-logger.info(f"Initializing at {NODE_URL}\nUsing address: {sys.argv[1]}")
+logger.info(f"Initializing at {NODE_URL}")
 
 def compute_metrics(eval_pred):
     logger.info("Computing metrics")
@@ -32,7 +52,7 @@ def compute_metrics(eval_pred):
 
 
 @logger.catch()
-def execute(task_args):
+def execute(TASK_ARGS):
     """This function executes the task."""
     logger.info("Executing task")
     
@@ -49,7 +69,7 @@ def execute(task_args):
     try: 
 
         model = AutoModelForSequenceClassification.from_pretrained(
-            task_args["model_name"], num_labels=task_args["num_labels"]
+            TASK_ARGS["model_name"], num_labels=TASK_ARGS["num_labels"]
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
@@ -60,47 +80,40 @@ def execute(task_args):
     
     logger.info(f"Model loaded on {device}" )
 
-    dataset = load_dataset(task_args["dataset_name"])
+    dataset = load_dataset(TASK_ARGS["dataset_name"])
     logger.debug(dataset)
-    logger.info(f"Dataset {task_args['dataset_name']} loaded")
+    logger.info(f"Dataset {TASK_ARGS['dataset_name']} loaded")
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
     logger.info("Dataset tokenized")
 
     logger.info("Tokenizing training run")
     logger.info(f"""
-{task_args["seed"]}
-{task_args["num_rows"]}
 """)
-    
-    if not tokenized_datasets:
-        raise ValueError("Datasets not loaded correctly!")
 
     try:
         small_train_dataset = (
-            tokenized_datasets["training"].shuffle(seed=task_args["seed"]).select(range(task_args["num_rows"]))
+            tokenized_datasets["train"].shuffle(42).select(range(1000))
         )
         logger.info("Tokenization complete")
         logger.info("Tokenizing evaluating run")
         small_eval_dataset = (
-            tokenized_datasets["test"].shuffle(seed=task_args["seed"]).select(range(task_args["num_rows"]))
+            tokenized_datasets["test"].shuffle(42).select(range(1000))
         )
     except Exception as error:
+        logger.error(f"Error during tokenization {error}")
         raise Exception(f"Error during tokenizing: {error}")
     
-    logger.error(f"Error during tokenization {error}")
+    
     logger.info("Tokenizing complete")
     
     
     training_args = TrainingArguments(
         output_dir="my_model", evaluation_strategy="epoch"
     )
-
-    if not small_eval_dataset or small_train_dataset:
-        raise ValueError("Datasets not loaded correctly!")
     
     logger.info("Results will be saved to ./my_model")
     logger.info("Starting training run")
-    
+
     try:
         trainer = Trainer(
             model=model,
@@ -109,6 +122,7 @@ def execute(task_args):
             eval_dataset=small_eval_dataset,
             compute_metrics=compute_metrics,
         )
+        accelerator.prepare(trainer)
     except Exception as error:
         logger.error(f"Error during training{error}")
         raise Exception(f"Error during training{error}")
@@ -178,9 +192,9 @@ def perform():
             try:
                 print_in_color(f"Preparing", "\033[33m")
                 time.sleep(10)
-                task_args = register_particle(addr)
+                TASK_ARGS = register_particle(addr)
                 print_in_color(f"Address {addr} received the task.", "\033[33m")
-                execute(task_args)
+                execute(TASK_ARGS)
                 print_in_color(f"Address {addr} executed the task.", "\033[32m")
                 complete_task(addr)
                 print_in_color(f"Address {addr} completed the task. ", "\033[32m")
