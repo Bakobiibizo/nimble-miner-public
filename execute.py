@@ -1,207 +1,192 @@
 """This module contains the code to execute the task."""
-
 import json
 import sys
-import time
+import os
 import numpy as np
 import requests
-import torch
 from requests import HTTPError
 from datasets import load_dataset
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
     Trainer, 
     TrainingArguments
     )
 from loguru import logger
 from accelerate import Accelerator, DistributedType
+from typing import Union, Dict
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+load_dotenv()
+
+logger.level("ERROR")
+
+class Miner:
+    distributed_type: DistributedType
+    model: Union[AutoModelForSequenceClassification, DDP]
+    tokenizer: Union[AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast]
+    task_args: Dict
+    accelerator: Accelerator
+    device: torch.device
 
 
-accelerator = Accelerator()
+class NimbleMiner(Miner, nn.Module):
+    def __init__(self, task_args=None):
+        super().__init__()
+        if task_args is None:
+            task_args = {
+                "model_name": "my_model/outputs/2024-03-22-01-16-17-693140/best_model/pytorch_model.bin",
+                "num_labels": 2,
+                "num_rows": 768,
+                "dataset_name": "yelp_review_full",
+                "seed": 42,
+                "node_url": "https://mainnet.nimble.technology:443",
+            }
+        self.accelerator = Accelerator()
+        self.distributed_type =  DistributedType.MULTI_GPU
+        self.task_args = task_args
+        self.device = self.accelerator.device
+        self.setup(rank=self.accelerator.local_process_index, world_size=self.accelerator.num_processes)
+        self.model = self.prepare_model()
+        self.tokenizer = self.prepare_tokenizer()
+        
+    def setup(self, rank, world_size):
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12356"
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-device = accelerator._get_devices()
+    def compute_metrics(self, eval_predictions):
+        logits, labels = eval_predictions
+        predictions = np.argmax(logits, axis=-1)
+        accuracy = (predictions == labels).astype(np.float32).mean().item()
+        return {"accuracy": accuracy}
 
-
-
-NODE_URL = "https://mainnet.nimble.technology:443"
-MODEL = "google-bert/bert-base-uncased"
-
-
-TASK_ARGS = {
-    "model_name": "bert-base-uncased",
-    "num_labels": 40000,
-    "num_rows": 40000,
-    "dataset_name": "yelp_review_full",
-    "seed": 42
-    }
-
-logger.add("output.log")
-
-
-logger.info(f"Initializing at {NODE_URL}")
-
-def compute_metrics(eval_pred):
-    logger.info("Computing metrics")
-    """This function computes the accuracy of the model."""
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return {
-        "accuracy": (predictions == labels).astype(np.float32).mean().item()
-    }
-
-
-@logger.catch()
-def execute(TASK_ARGS):
-    """This function executes the task."""
-    logger.info("Executing task")
+    def prepare_tokenizer(self):
+        return AutoTokenizer.from_pretrained(self.task_args["model_name"])
     
-    print_in_color("Starting training...", "\033[34m")  # Blue for start
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-
-    def tokenize_function(examples):
-        logger.info("Tokenizing task")
-        return tokenizer(
-            examples["text"], padding="max_length", truncation=True
+    def prepare_model(self):
+        return AutoModelForSequenceClassification.from_pretrained(
+            self.task_args["model_name"], num_labels=self.task_args["num_labels"]
         )
 
-    try: 
+    @logger.catch()
+    def execute(self):
+        self.print_colored("Starting training...", "blue")  # Blue for start
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            TASK_ARGS["model_name"], num_labels=TASK_ARGS["num_labels"]
+
+        dataset = load_dataset(self.task_args["dataset_name"])
+
+        logger.info(f"Dataset {self.task_args['dataset_name']} loaded")
+
+        train_dataset = dataset["train"].shuffle(self.task_args["seed"]).select(range(self.task_args["num_rows"]))
+        eval_dataset = dataset["test"].shuffle(self.task_args["seed"]).select(range(self.task_args["num_labels"]))
+
+        logger.info("Tokenizing complete")
+
+        training_args = TrainingArguments(
+            output_dir="my_model", evaluation_strategy="epoch"
         )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
 
-    except Exception as error:
-        logger.error(f"Error during loading of the model {error}")
-        raise Exception(f"Error during loading of the model")
-    
-    logger.info(f"Model loaded on {device}" )
+        eval_dataset, train_dataset = self.accelerator.prepare(eval_dataset, train_dataset, self.device)
 
-    dataset = load_dataset(TASK_ARGS["dataset_name"])
-    logger.debug(dataset)
-    logger.info(f"Dataset {TASK_ARGS['dataset_name']} loaded")
-    tokenized_datasets = dataset.map(tokenize_function, batched=True)
-    logger.info("Dataset tokenized")
-
-    logger.info("Tokenizing training run")
-    logger.info(f"""
-""")
-
-    try:
-        small_train_dataset = (
-            tokenized_datasets["train"].shuffle(42).select(range(1000))
-        )
-        logger.info("Tokenization complete")
-        logger.info("Tokenizing evaluating run")
-        small_eval_dataset = (
-            tokenized_datasets["test"].shuffle(42).select(range(1000))
-        )
-    except Exception as error:
-        logger.error(f"Error during tokenization {error}")
-        raise Exception(f"Error during tokenizing: {error}")
-    
-    
-    logger.info("Tokenizing complete")
-    
-    
-    training_args = TrainingArguments(
-        output_dir="my_model", evaluation_strategy="epoch"
-    )
-    
-    logger.info("Results will be saved to ./my_model")
-    logger.info("Starting training run")
-
-    try:
         trainer = Trainer(
-            model=model,
+            model=self.accelerator.prepare_model(self.model),
             args=training_args,
-            train_dataset=small_train_dataset,
-            eval_dataset=small_eval_dataset,
-            compute_metrics=compute_metrics,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            compute_metrics=self.compute_metrics,
         )
-        accelerator.prepare(trainer)
-    except Exception as error:
-        logger.error(f"Error during training{error}")
-        raise Exception(f"Error during training{error}")
-    
-    logger.info("Starting training run")
-    trainer.train()
-    logger.info("Training run complete")
-    trainer.save_model("my_model")
-    logger.info("Model has been saved to ./my_model")
+
+        logger.info("Starting training run")
+        trainer.train()
+        
+        trainer.save_model("my_model")
+        logger.info("Model has been saved to ./my_model")
 
 
-def print_in_color(text, color_code):
-    """This function prints the text in the specified color."""
-    END_COLOR = "\033[0m"
-    print(f"{color_code}{text}{END_COLOR}")
+    def print_colored(self, text, color):
+        """Print the given text in the specified ANSI color code."""
+        print(f"\033[{color}m{text}\033[0m")
 
 
-def register_particle(addr):
-    """This function inits the particle."""
+    def register_particle(self, addr):
+        """This function inits the particle."""
 
-    logger.info("Registering particle")
-    url = f"{NODE_URL}/register_particle"
-    
-    try:
-        response = requests.post(url, timeout=10, json={"address": addr})
-        if response.status_code == 200:
-            task = response.json()
-            return task['args']
-    except HTTPError as error:
-        logger.error(f"Error during http request:\n{response.content}")
-        raise HTTPError(f"Error during http request:\n{error}\nResponse:{response.content}")
+        logger.info("Registering particle")
+        url = f"{self.task_args['node_url']}/register_particle"
 
-
-def complete_task(wallet_address):
-    """This function completes the task."""
-    logger.info("Final step")
-
-    url = f"{NODE_URL}/complete_task"
-    json_data = json.dumps({"address": wallet_address})
-    files = {
-        "file1": open("my_model/config.json", "rb"),
-        "file2": open("my_model/training_args.bin", "rb"),
-        "r": (None, json_data, "application/json")
-    }
-
-    logger.info("making request")
-    
-    try:
-        response = requests.post(url, files=files, timeout=60)
-        if response.status_code == 200:
-            logger.info("Complete!")
-            return response.json()
-    
-    except HTTPError as error:
-        logger.error(f"Error during http request:\n{response.content}")
-        raise HTTPError(f"Error during http request:\n{error}\nResponse:{response.content}")
+        try:
+            response = requests.post(url, timeout=10, json={"address": addr})
+            if response.status_code == 200:
+                task = response.json()
+                return task['args']
+        except HTTPError as error:
+            logger.error(f"Error during http request:\n{response.content}")
+            raise HTTPError(
+                f"Error during http request:\n{error}\nResponse:{response.content}"
+            ) from error
 
 
-def perform():
-    logger.info("Performing Task")
-    
-    addr = sys.argv[1] 
+    def complete_task(self):
+        """This function completes the task."""
+        logger.info("Final step")
 
-    if addr is not None:
-        print_in_color(f"Address {addr} started to work.", "\033[33m")
-        while True:
-            try:
-                print_in_color(f"Preparing", "\033[33m")
-                time.sleep(10)
-                TASK_ARGS = register_particle(addr)
-                print_in_color(f"Address {addr} received the task.", "\033[33m")
-                execute(TASK_ARGS)
-                print_in_color(f"Address {addr} executed the task.", "\033[32m")
-                complete_task(addr)
-                print_in_color(f"Address {addr} completed the task. ", "\033[32m")
-            except Exception as e:
-                print_in_color(f"Error: {e}", "\033[31m")
-    else:
-        print_in_color("Address not provided.", "\033[31m")
-    
+        url = f"{self.task_args['node_url']}/complete_task"
+        json_data = json.dumps({"address": os.getenv('NIMBLE_ADDR')})
+        files = {
+            "file1": open("my_model/config.json", "rb"),
+            "file2": open("my_model/training_args.bin", "rb"),
+            "r": (None, json_data, "application/json")
+        }
+
+        logger.info("making request")
+
+        try:
+            response = requests.post(url, files=files, timeout=60)
+            if response.status_code == 200:
+                logger.info("Complete!")
+                with open("tracker.json", "r", encoding="utf-8") as f:
+                    tracker = json.loads(f.read())
+                    tracker["count"] += 1
+                with open("tracker.json", "w", encoding="utf-8") as f:
+                    f.write(json.dumps(tracker))
+
+
+                return response.json()
+
+        except HTTPError as error:
+            logger.error(f"Error during http request:\n{response.content}")
+            raise HTTPError(f"Error during http request:\n{error}\nResponse:{response.content}")
+
+
+    def perform(self):
+        if address := os.getenv("NIMBLE_ADDR"):
+            logger.info(f"Address {address} started to work.")
+            while True:
+                try:
+                    self.register_particle(address)
+                    self.execute()
+                    self.complete_task()
+                    logger.info(f"Address {address} completed the task.")
+                except Exception as e:
+                    logger.error(f"Error: {e}")
+        else:
+            logger.error("Address not provided.")
+
+
+def run():
+    miner = NimbleMiner()
+    miner.perform()
+
 if __name__ == "__main__":
-    perform()
+    run()
+

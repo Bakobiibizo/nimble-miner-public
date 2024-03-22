@@ -3,4 +3,6 @@ my_model/
 .env
 .venv
 venv
-
+*.bin
+*.json
+nimble-bert-v2
