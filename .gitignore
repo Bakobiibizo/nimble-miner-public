@@ -3,4 +3,5 @@ my_model/
 .env
 .venv
 venv
-
+.vscode
+nimble-bert-v2
