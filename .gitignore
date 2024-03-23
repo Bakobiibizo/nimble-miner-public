@@ -1,2 +1,5 @@
-nimenv_localminers/
-my_model/
+.env
+.venv
+*.bin
+.vscode
+nimble-bert-v2
