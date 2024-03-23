@@ -3,3 +3,4 @@
 *.bin
 .vscode
 nimble-bert-v2
+my_model
