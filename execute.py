@@ -6,43 +6,17 @@ import time
 import numpy as np
 import requests
 import torch
-from requests import HTTPError
 from datasets import load_dataset
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    Trainer, 
-    TrainingArguments
-    )
-from loguru import logger
-from accelerate import Accelerator, DistributedType
+from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
+                          Trainer, TrainingArguments)
+from dotenv import load_dotenv
+import os
+load_dotenv()
 
+node_url = "https://mainnet.nimble.technology:443"
 
-accelerator = Accelerator()
-
-device = accelerator._get_devices()
-
-
-
-NODE_URL = "https://mainnet.nimble.technology:443"
-MODEL = "google-bert/bert-base-uncased"
-
-
-TASK_ARGS = {
-    "model_name": "bert-base-uncased",
-    "num_labels": 40000,
-    "num_rows": 40000,
-    "dataset_name": "yelp_review_full",
-    "seed": 42
-    }
-
-logger.add("output.log")
-
-
-logger.info(f"Initializing at {NODE_URL}")
 
 def compute_metrics(eval_pred):
-    logger.info("Computing metrics")
     """This function computes the accuracy of the model."""
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
@@ -51,87 +25,45 @@ def compute_metrics(eval_pred):
     }
 
 
-@logger.catch()
-def execute(TASK_ARGS):
+def execute(task_args):
     """This function executes the task."""
-    logger.info("Executing task")
-    
     print_in_color("Starting training...", "\033[34m")  # Blue for start
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(task_args["model_name"])
 
     def tokenize_function(examples):
-        logger.info("Tokenizing task")
         return tokenizer(
             examples["text"], padding="max_length", truncation=True
         )
 
-    try: 
+    model = AutoModelForSequenceClassification.from_pretrained(
+        task_args["model_name"], num_labels=task_args["num_labels"]
+    )
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            TASK_ARGS["model_name"], num_labels=TASK_ARGS["num_labels"]
-        )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-
-    except Exception as error:
-        logger.error(f"Error during loading of the model {error}")
-        raise Exception(f"Error during loading of the model")
-    
-    logger.info(f"Model loaded on {device}" )
-
-    dataset = load_dataset(TASK_ARGS["dataset_name"])
-    logger.debug(dataset)
-    logger.info(f"Dataset {TASK_ARGS['dataset_name']} loaded")
+    dataset = load_dataset(task_args["dataset_name"])
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
-    logger.info("Dataset tokenized")
 
-    logger.info("Tokenizing training run")
-    logger.info(f"""
-""")
-
-    try:
-        small_train_dataset = (
-            tokenized_datasets["train"].shuffle(42).select(range(1000))
-        )
-        logger.info("Tokenization complete")
-        logger.info("Tokenizing evaluating run")
-        small_eval_dataset = (
-            tokenized_datasets["test"].shuffle(42).select(range(1000))
-        )
-    except Exception as error:
-        logger.error(f"Error during tokenization {error}")
-        raise Exception(f"Error during tokenizing: {error}")
-    
-    
-    logger.info("Tokenizing complete")
-    
-    
+    small_train_dataset = (
+        tokenized_datasets["train"].shuffle(seed=task_args["seed"]).select(range(task_args["num_rows"]))
+    )
+    small_eval_dataset = (
+        tokenized_datasets["test"].shuffle(seed=task_args["seed"]).select(range(task_args["num_rows"]))
+    )
     training_args = TrainingArguments(
         output_dir="my_model", evaluation_strategy="epoch"
     )
-    
-    logger.info("Results will be saved to ./my_model")
-    logger.info("Starting training run")
 
-    try:
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=small_train_dataset,
-            eval_dataset=small_eval_dataset,
-            compute_metrics=compute_metrics,
-        )
-        accelerator.prepare(trainer)
-    except Exception as error:
-        logger.error(f"Error during training{error}")
-        raise Exception(f"Error during training{error}")
-    
-    logger.info("Starting training run")
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=small_train_dataset,
+        eval_dataset=small_eval_dataset,
+        compute_metrics=compute_metrics,
+    )
     trainer.train()
-    logger.info("Training run complete")
     trainer.save_model("my_model")
-    logger.info("Model has been saved to ./my_model")
 
 
 def print_in_color(text, color_code):
@@ -142,62 +74,59 @@ def print_in_color(text, color_code):
 
 def register_particle(addr):
     """This function inits the particle."""
-
-    logger.info("Registering particle")
-    url = f"{NODE_URL}/register_particle"
-    
-    try:
-        response = requests.post(url, timeout=10, json={"address": addr})
-        if response.status_code == 200:
-            task = response.json()
-            return task['args']
-    except HTTPError as error:
-        logger.error(f"Error during http request:\n{response.content}")
-        raise HTTPError(f"Error during http request:\n{error}\nResponse:{response.content}")
+    url = f"{node_url}/register_particle"
+    response = requests.post(url, timeout=10, json={"address": addr})
+    if response.status_code != 200:
+        raise Exception(f"Failed to init particle: Try later.")
+    task = response.json()
+    task['args']['num_rows']=29119
+    return task['args']
 
 
 def complete_task(wallet_address):
     """This function completes the task."""
-    logger.info("Final step")
 
-    url = f"{NODE_URL}/complete_task"
-    json_data = json.dumps({"address": wallet_address})
+    url = f"{node_url}/complete_task"
     files = {
         "file1": open("my_model/config.json", "rb"),
         "file2": open("my_model/training_args.bin", "rb"),
-        "r": (None, json_data, "application/json")
     }
-
-    logger.info("making request")
-    
-    try:
-        response = requests.post(url, files=files, timeout=60)
-        if response.status_code == 200:
-            logger.info("Complete!")
-            return response.json()
-    
-    except HTTPError as error:
-        logger.error(f"Error during http request:\n{response.content}")
-        raise HTTPError(f"Error during http request:\n{error}\nResponse:{response.content}")
+    json_data = json.dumps({"address": wallet_address})
+    files["r"] = (None, json_data, "application/json")
+    response = requests.post(url, files=files, timeout=60)
+    if response.status_code != 200:
+        raise Exception(f"Failed to complete task: Try later.")
+    return response.json()
 
 
 def perform():
-    logger.info("Performing Task")
-    
-    addr = sys.argv[1] 
 
+    addr =  os.getenv('NIMBLE_ADDR')
     if addr is not None:
-        print_in_color(f"Address {addr} started to work.", "\033[33m")
+        completed_jobs = 0
+        
+        with open("jobs.txt", "r") as f:
+            TotalJobs = f.read()
+        print_in_color(f"""
+Address {addr} started to work.", "\033[33m
+Previous jobs: {TotalJobs}
+Current jobs: {completed_jobs}
+""", "\033[33m")
         while True:
             try:
                 print_in_color(f"Preparing", "\033[33m")
-                time.sleep(10)
-                TASK_ARGS = register_particle(addr)
+                time.sleep(30)
+                task_args = register_particle(addr)
+                time.sleep(60)
                 print_in_color(f"Address {addr} received the task.", "\033[33m")
-                execute(TASK_ARGS)
+                execute(task_args)
                 print_in_color(f"Address {addr} executed the task.", "\033[32m")
                 complete_task(addr)
+                completed_jobs += 1
                 print_in_color(f"Address {addr} completed the task. ", "\033[32m")
+                print_in_color(f"Jobs completed: {completed_jobs}", "\033[32m")
+                with open("jobs.txt", "w") as f:
+                    f.write(str(completed_jobs + TotalJobs))
             except Exception as e:
                 print_in_color(f"Error: {e}", "\033[31m")
     else:
